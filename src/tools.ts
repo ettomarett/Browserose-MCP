@@ -158,7 +158,7 @@ const TOOLS = [
   },
   {
     name: "browser_click_locator",
-    description: "Click by Playwright locator. Use frameSelector for iframes (e.g. iframe#a >> iframe#b); omit for main page. Provide one of: role+name, text, or css. No snapshot needed.",
+    description: "Click by Playwright locator. Use frameSelector for iframes; omit for main page. Provide one of: role+name, text, or css. Optional: nth (0-based index), enabledOnly (click first enabled match), scopeCss (resolve within container).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -166,7 +166,10 @@ const TOOLS = [
         role: { type: "string", description: "ARIA role, e.g. button, link" },
         name: { type: "string", description: "Accessible name (regex or string); use with role" },
         text: { type: "string", description: "Visible text to match (alternative to role+name)" },
-        css: { type: "string", description: "CSS selector (e.g. input[type=email], button:has-text(\"Next\"))" },
+        css: { type: "string", description: "CSS selector (e.g. input[type=email], button)" },
+        nth: { type: "number", description: "Optional. 0-based index of match (e.g. 3 = 4th match). Use when multiple elements match." },
+        enabledOnly: { type: "boolean", description: "Optional. If true, click the first matching element that is not disabled (e.g. first enabled SUBMIT among several)." },
+        scopeCss: { type: "string", description: "Optional. Resolve the locator only within this container (e.g. .quiz-card to avoid matching sidebar)." },
         force: { type: "boolean", description: "Skip actionability checks", default: false },
         timeoutMs: { type: "number", description: "Timeout in ms", default: 10000 },
       },
@@ -174,7 +177,7 @@ const TOOLS = [
   },
   {
     name: "browser_type_locator",
-    description: "Type text into an element found by locator. Omit frameSelector for main page. Provide one of: role+name, text, or css.",
+    description: "Type text into an element found by locator. Omit frameSelector for main page. Provide one of: role+name, text, or css. Optional: nth (0-based index), scopeCss (resolve within container).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -183,6 +186,8 @@ const TOOLS = [
         name: { type: "string", description: "Accessible name; use with role" },
         text: { type: "string", description: "Visible text to match" },
         css: { type: "string", description: "CSS selector, e.g. input[type=email]" },
+        nth: { type: "number", description: "Optional. 0-based index of match when multiple elements match." },
+        scopeCss: { type: "string", description: "Optional. Resolve the locator only within this container." },
         input: { type: "string", description: "Text to type into the element" },
         submit: { type: "boolean", description: "Press Enter after typing", default: false },
         timeoutMs: { type: "number", description: "Timeout in ms", default: 10000 },
@@ -192,11 +197,17 @@ const TOOLS = [
   },
   {
     name: "browser_list_clickables",
-    description: "List visible clickable elements (buttons, links) in a frame. Use to discover what to click without snapshot. Works in cross-origin iframes.",
+    description: "List visible clickable elements (buttons, links) in a frame. Optionally filter by role+name, text, or css; filter by enabledOnly; or scope to a container (scopeCss). Use to discover what to click without snapshot.",
     inputSchema: {
       type: "object" as const,
       properties: {
         frameSelector: { type: "string", description: "Chained iframe selector, e.g. iframe#pplayer_iframe >> iframe#modulePlayerIframe" },
+        role: { type: "string", description: "Optional. Filter to this ARIA role (e.g. button). Use with name for exact filter." },
+        name: { type: "string", description: "Optional. Filter to accessible name (regex); use with role." },
+        text: { type: "string", description: "Optional. Filter to elements whose text contains this (substring)." },
+        css: { type: "string", description: "Optional. Filter to elements matching this CSS selector." },
+        enabledOnly: { type: "boolean", description: "Optional. If true, list only enabled elements.", default: false },
+        scopeCss: { type: "string", description: "Optional. List only clickables within this container selector." },
         includeBoundingBox: { type: "boolean", description: "Include x,y,width,height for each", default: false },
         timeoutMs: { type: "number", description: "Timeout to resolve frame and elements", default: 10000 },
       },
@@ -277,6 +288,36 @@ const TOOLS = [
         ry: { type: "number", description: "Relative Y in 0..1" },
       },
       required: ["frameSelector", "rx", "ry"],
+    },
+  },
+  {
+    name: "browser_evaluate_click",
+    description: "Click an element inside a frame via DOM .click() (runs in frame context). Bypasses visibility/actionability. Use when locator click fails (e.g. SUBMIT disabled or not visible). Same-origin frame only.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        frameSelector: { type: "string", description: "Chained iframe selector" },
+        css: { type: "string", description: "CSS selector (e.g. button.quiz-card__button, [aria-label=SUBMIT])" },
+        nth: { type: "number", description: "Optional. 0-based index when multiple match (default 0)", default: 0 },
+        timeoutMs: { type: "number", description: "Timeout to resolve frame", default: 10000 },
+      },
+      required: ["frameSelector", "css"],
+    },
+  },
+  {
+    name: "browser_evaluate_click_by_text",
+    description: "Click an element by its text content via DOM .click() inside the frame. Bypasses visibility/actionability and overlay issues. Use when locator/click_at_rel fail (e.g. quiz options). Same-origin frame only.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        frameSelector: { type: "string", description: "Chained iframe selector" },
+        text: { type: "string", description: "Exact or partial text to match (see match param)" },
+        match: { type: "string", description: "exact = trimmed text equals; contains = textContent includes", default: "exact" },
+        scopeCss: { type: "string", description: "Optional. Search only inside this container (e.g. .page-lesson to exclude sidebar)" },
+        nth: { type: "number", description: "0-based index when multiple elements match (default 0)", default: 0 },
+        timeoutMs: { type: "number", description: "Timeout to resolve frame", default: 10000 },
+      },
+      required: ["frameSelector", "text"],
     },
   },
 ];
@@ -478,29 +519,51 @@ export function registerTools(server: Server): void {
           const frameSelector = params.frameSelector != null ? String(params.frameSelector) : "";
           const timeoutMs = Number(params.timeoutMs) || 10000;
           const force = Boolean(params.force);
-          const root = frameSelector
+          const nth = params.nth !== undefined && params.nth !== null ? Number(params.nth) : undefined;
+          const enabledOnly = Boolean(params.enabledOnly);
+          const scopeCss = params.scopeCss != null ? String(params.scopeCss) : undefined;
+          let root: any = frameSelector
             ? getChainedFrameLocator(page, frameSelector)
             : (page as unknown as { getByRole: typeof page.getByRole; getByText: typeof page.getByText; locator: typeof page.locator });
+          if (scopeCss) root = root.locator(scopeCss).first();
           const role = params.role != null ? String(params.role) : undefined;
           const name = params.name != null ? String(params.name) : undefined;
           const text = params.text != null ? String(params.text) : undefined;
           const css = params.css != null ? String(params.css) : undefined;
 
-          let locator: any;
+          let baseLocator: any;
           if (role !== undefined) {
-            locator = name
-              ? root.getByRole(role as "button" | "link" | "textbox", { name: new RegExp(name, "i") }).first()
-              : root.getByRole(role as "button" | "link").first();
+            const roleOpts: { name?: RegExp; disabled?: boolean } = name ? { name: new RegExp(name, "i") } : {};
+            if (enabledOnly) roleOpts.disabled = false;
+            baseLocator = root.getByRole(role as "button" | "link" | "textbox", roleOpts);
           } else if (text !== undefined) {
-            locator = root.getByText(text, { exact: false }).first();
+            baseLocator = root.getByText(text, { exact: false });
           } else if (css !== undefined) {
-            locator = root.locator(css).first();
+            baseLocator = root.locator(css);
           } else {
             return toolResult("Provide one of: role (+ optional name), text, or css", true);
           }
+          if (enabledOnly && role === undefined) {
+            try {
+              const all = await baseLocator.all();
+              const enabled: any[] = [];
+              for (const el of all) {
+                const disabled = await el.isDisabled().catch(() => true);
+                if (!disabled) enabled.push(el);
+              }
+              const index = nth !== undefined && !Number.isNaN(nth) ? Math.min(nth, enabled.length - 1) : 0;
+              if (enabled.length === 0 || index < 0) return toolResult("No enabled matching element found", true);
+              await enabled[index].click({ timeout: timeoutMs, force });
+              return toolResult(`Clicked ${nth !== undefined ? `nth=${nth} (enabled)` : "first enabled"} (${text !== undefined ? "text" : "css"})`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              return toolResult(`Click failed: ${msg}`, true);
+            }
+          }
+          const locator = (nth !== undefined && !Number.isNaN(nth)) ? baseLocator.nth(nth) : baseLocator.first();
           try {
             await locator.click({ timeout: timeoutMs, force });
-            return toolResult(`Clicked (${role ? `role=${role}` : text !== undefined ? `text="${text}"` : `css=${css}`})`);
+            return toolResult(`Clicked (${role ? `role=${role}` : text !== undefined ? `text="${text}"` : `css=${css}`}${nth !== undefined ? ` nth=${nth}` : ""})`);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             return toolResult(`Click failed: ${msg}`, true);
@@ -510,27 +573,31 @@ export function registerTools(server: Server): void {
           const { page } = await ensureBrowser();
           const frameSelector = params.frameSelector != null ? String(params.frameSelector) : "";
           const timeoutMs = Number(params.timeoutMs) || 10000;
-          const root = frameSelector
+          const nth = params.nth !== undefined && params.nth !== null ? Number(params.nth) : undefined;
+          const scopeCss = params.scopeCss != null ? String(params.scopeCss) : undefined;
+          let root: any = frameSelector
             ? getChainedFrameLocator(page, frameSelector)
             : (page as unknown as { getByRole: typeof page.getByRole; getByText: typeof page.getByText; locator: typeof page.locator });
+          if (scopeCss) root = root.locator(scopeCss).first();
           const role = params.role != null ? String(params.role) : undefined;
           const name = params.name != null ? String(params.name) : undefined;
           const text = params.text != null ? String(params.text) : undefined;
           const css = params.css != null ? String(params.css) : undefined;
           const input = String(params.input ?? "");
           if (!input && !params.submit) return toolResult("Provide input text (or submit: true to press Enter)", true);
-          let locator: any;
+          let baseLocator: any;
           if (role !== undefined) {
-            locator = name
-              ? root.getByRole(role as "textbox" | "searchbox", { name: new RegExp(name, "i") }).first()
-              : root.getByRole(role as "textbox").first();
+            baseLocator = name
+              ? root.getByRole(role as "textbox" | "searchbox", { name: new RegExp(name, "i") })
+              : root.getByRole(role as "textbox");
           } else if (text !== undefined) {
-            locator = root.getByText(text, { exact: false }).first();
+            baseLocator = root.getByText(text, { exact: false });
           } else if (css !== undefined) {
-            locator = root.locator(css).first();
+            baseLocator = root.locator(css);
           } else {
             return toolResult("Provide one of: role (+ optional name), text, or css", true);
           }
+          const locator = (nth !== undefined && !Number.isNaN(nth)) ? baseLocator.nth(nth) : baseLocator.first();
           try {
             if (input) await locator.fill(input, { timeout: timeoutMs });
             if (params.submit) await locator.press("Enter", { timeout: timeoutMs });
@@ -546,19 +613,47 @@ export function registerTools(server: Server): void {
           if (!frameSelector) return toolResult("Missing frameSelector", true);
           const timeoutMs = Number(params.timeoutMs) || 10000;
           const includeBoundingBox = Boolean(params.includeBoundingBox);
-          const frame = getChainedFrameLocator(page, frameSelector);
-          const selector =
-            'button, a[href], [role="button"], [role="link"], input[type="submit"], input[type="button"]';
-          const locator = frame.locator(selector);
+          const enabledOnly = Boolean(params.enabledOnly);
+          const scopeCss = params.scopeCss != null ? String(params.scopeCss) : undefined;
+          const role = params.role != null ? String(params.role) : undefined;
+          const name = params.name != null ? String(params.name) : undefined;
+          const text = params.text != null ? String(params.text) : undefined;
+          const css = params.css != null ? String(params.css) : undefined;
+          let root: any = getChainedFrameLocator(page, frameSelector);
+          if (scopeCss) root = root.locator(scopeCss).first();
+          let locator: any;
+          if (role !== undefined) {
+            locator = name
+              ? root.getByRole(role as "button" | "link", { name: new RegExp(name, "i") })
+              : root.getByRole(role as "button" | "link");
+          } else if (text !== undefined) {
+            locator = root.getByText(text, { exact: false });
+          } else if (css !== undefined) {
+            locator = root.locator(css);
+          } else if (name !== undefined) {
+            locator = root.locator('button, a, [role="button"], [role="link"]').filter({ hasText: new RegExp(name, "i") });
+          } else {
+            locator = root.locator(
+              'button, a[href], [role="button"], [role="link"], input[type="submit"], input[type="button"]'
+            );
+          }
           try {
-            const all = await locator.all();
-            const lines: string[] = [`Found ${all.length} clickable(s) in frame:`];
+            let all = await locator.all();
+            if (enabledOnly) {
+              const filtered: any[] = [];
+              for (const node of all) {
+                const disabled = await node.isDisabled().catch(() => true);
+                if (!disabled) filtered.push(node);
+              }
+              all = filtered;
+            }
+            const lines: string[] = [`Found ${all.length} clickable(s)${enabledOnly ? " (enabled only)" : ""} in frame:`];
             for (let i = 0; i < all.length; i++) {
               const node = all[i];
-              const text = await node.textContent().catch(() => null);
+              const textContent = await node.textContent().catch(() => null);
               const aria = await node.getAttribute("aria-label").catch(() => null);
               const disabled = await node.isDisabled().catch(() => true);
-              const label = (aria ?? text ?? "").trim().slice(0, 100) || "(no text)";
+              const label = (aria ?? textContent ?? "").trim().slice(0, 100) || "(no text)";
               let line = `${i + 1}. "${label}" ${disabled ? "[disabled]" : "[enabled]"}`;
               if (includeBoundingBox) {
                 const bbox = await node.boundingBox().catch(() => null);
@@ -730,6 +825,89 @@ export function registerTools(server: Server): void {
               { type: "image" as const, data: base64, mimeType: "image/png" },
             ],
           };
+        }
+        case "browser_evaluate_click": {
+          const { page } = await ensureBrowser();
+          const frameSelector = String(params.frameSelector ?? "");
+          const css = String(params.css ?? "");
+          const nth = params.nth !== undefined && params.nth !== null ? Number(params.nth) : 0;
+          const timeoutMs = Number(params.timeoutMs) || 10000;
+          if (!frameSelector || !css) return toolResult("Missing frameSelector or css", true);
+          try {
+            const frame = await getFrameForSelector(page, frameSelector);
+            if (!frame) return toolResult("Frame not found or not yet attached", true);
+            const clicked = await frame.evaluate(
+              ({ selector, index }: { selector: string; index: number }) => {
+                const el = document.querySelectorAll(selector)[index];
+                if (el && typeof (el as HTMLElement).click === "function") {
+                  (el as HTMLElement).click();
+                  return true;
+                }
+                return false;
+              },
+              { selector: css, index: nth >= 0 ? nth : 0 }
+            );
+            return toolResult(clicked ? `Clicked ${css}${nth ? ` (nth=${nth})` : ""}` : `No clickable element at ${css} (nth=${nth})`, !clicked);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return toolResult(`evaluate_click failed: ${msg}`, true);
+          }
+        }
+        case "browser_evaluate_click_by_text": {
+          const { page } = await ensureBrowser();
+          const frameSelector = String(params.frameSelector ?? "");
+          const text = String(params.text ?? "").trim();
+          const match = String(params.match ?? "exact").toLowerCase() === "contains" ? "contains" : "exact";
+          const scopeCss = params.scopeCss != null ? String(params.scopeCss) : undefined;
+          const nth = params.nth !== undefined && params.nth !== null ? Number(params.nth) : 0;
+          const timeoutMs = Number(params.timeoutMs) || 10000;
+          if (!frameSelector || !text) return toolResult("Missing frameSelector or text", true);
+          try {
+            const frame = await getFrameForSelector(page, frameSelector);
+            if (!frame) return toolResult("Frame not found or not yet attached", true);
+            const arg = { text, match: match as "exact" | "contains", scopeCss, nth: nth >= 0 ? nth : 0 };
+            const result = await frame.evaluate(
+              (a: { text: string; match: "exact" | "contains"; scopeCss?: string; nth: number }) => {
+                const root = a.scopeCss ? document.querySelector(a.scopeCss) : document.body;
+                if (!root) return { ok: false, reason: "scopeCss not found" };
+                const walk = (node: Element): Element[] => {
+                  const out: Element[] = [];
+                  if (node.nodeType === Node.ELEMENT_NODE) {
+                    const el = node as HTMLElement;
+                    const trimmed = el.textContent?.trim() ?? "";
+                    const matches = a.match === "exact" ? trimmed === a.text : trimmed.includes(a.text);
+                    if (matches) out.push(el);
+                    for (let i = 0; i < node.children.length; i++) out.push(...walk(node.children[i]));
+                  }
+                  return out;
+                };
+                const candidates = walk(root);
+                const visible = candidates.filter((el) => {
+                  const rect = el.getBoundingClientRect();
+                  if (rect.width < 1 || rect.height < 1) return false;
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none" || style.pointerEvents === "none") return false;
+                  return true;
+                });
+                visible.sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return ra.width * ra.height - rb.width * rb.height;
+                });
+                const index = a.nth >= 0 ? a.nth : 0;
+                const target = visible[index] as HTMLElement | undefined;
+                if (!target || typeof target.click !== "function") return { ok: false, reason: `No matching element at nth=${index} (found ${visible.length})` };
+                target.click();
+                return { ok: true };
+              },
+              arg
+            );
+            if (result.ok) return toolResult(`Clicked by text "${text}"${nth ? ` (nth=${nth})` : ""}`);
+            return toolResult(`evaluate_click_by_text: ${result.reason}`, true);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return toolResult(`evaluate_click_by_text failed: ${msg}`, true);
+          }
         }
         default:
           return toolResult(`Unknown tool: ${name}`, true);
